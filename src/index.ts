@@ -21,6 +21,7 @@ const APPROVAL_GRANT_TTL_MS = 15 * 60 * 1000
 const MAX_APPROVAL_SESSIONS = 200
 const MAX_APPROVALS_PER_SESSION = 5
 const CONFIRMATION_MAX_CHARS = 60
+const MAX_REGEX_SCAN_CHARS = 4_000
 const CONFIRM_PHRASES = [
   "yes",
   "y",
@@ -1027,6 +1028,9 @@ export function extractApprovalPathPrefixes(command: string): string[] {
  */
 export function detectApprovalSignal(text: string | null | undefined): "confirm" | "reject" | null {
   if (!text) return null
+  // Bound the input before any regex work so an attacker cannot use an
+  // arbitrarily long message to drive worst-case regex evaluation cost.
+  if (text.length > MAX_REGEX_SCAN_CHARS) return null
   const normalized = text.trim().toLowerCase().replace(/[.!?]+$/, "")
   if (!normalized || normalized.length > CONFIRMATION_MAX_CHARS) return null
   const matchesPhrase = (phrases: string[]) =>
@@ -1048,7 +1052,7 @@ export function isSoftRiskyOperation(
   command: string,
 ): boolean {
   if (analysis.hardBlockReason) return false
-  return external || ambiguous || DOWNLOAD_SIGNAL.test(command)
+  return external || ambiguous || DOWNLOAD_SIGNAL.test(command.slice(0, MAX_REGEX_SCAN_CHARS))
 }
 
 /**
@@ -1070,7 +1074,7 @@ export function approvalMatches(
   if (approval.pathPrefixes.length > 0) {
     const withinScope = pathPrefixes.every((prefix) =>
       approval.pathPrefixes.some(
-        (approved) => prefix === approved || prefix.startsWith(`${approved}/`) || approved.startsWith(`${prefix}/`),
+        (approved) => prefix === approved || prefix.startsWith(`${approved}/`),
       ),
     )
     if (!withinScope) return false
@@ -1258,7 +1262,7 @@ export default (async ({ client, directory, $ }, options) => {
     const riskTags = [
       ...(external ? ["external-path"] : []),
       ...(ambiguous ? ["ambiguous-path"] : []),
-      ...(DOWNLOAD_SIGNAL.test(command) ? ["download-artifact"] : []),
+      ...(DOWNLOAD_SIGNAL.test(command.slice(0, MAX_REGEX_SCAN_CHARS)) ? ["download-artifact"] : []),
     ]
 
     const existingApprovals = grantedApprovals.get(sessionID) ?? []
