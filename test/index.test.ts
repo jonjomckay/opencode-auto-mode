@@ -106,10 +106,11 @@ async function executeBefore(
   hooks: Awaited<ReturnType<typeof autoMode>>,
   tool: string,
   args: Record<string, unknown>,
+  callID = "call",
 ) {
   const hook = hooks["tool.execute.before"]
   if (!hook) throw new Error("tool.execute.before hook is missing")
-  return hook({ tool, sessionID: "session", callID: "call" }, { args })
+  return hook({ tool, sessionID: "session", callID }, { args })
 }
 
 describe("configuration", () => {
@@ -1126,5 +1127,155 @@ describe("pre-execution review", () => {
     } finally {
       await rm(base, { recursive: true, force: true })
     }
+  })
+})
+
+describe("deterministic user-approval handling", () => {
+  const sdkCommand = "~/Android/Sdk/cmdline-tools/latest/bin/sdkmanager --licenses"
+
+  async function makeApprovalHooks(reviewerText = "ALLOW: reviewed", initialUserMessages: string[] = []) {
+    const state: MockState = { promptCalls: 0, reviewerRequests: [], permissionResponses: [] }
+    const userMessages = [...initialUserMessages]
+    const client = {
+      app: { log: async () => ({ data: true }) },
+      tui: { showToast: async () => ({ data: true }) },
+      session: {
+        messages: async () => ({
+          data: userMessages.map((text, index) => ({
+            info: { id: `user-${index}`, role: "user" },
+            parts: [{ type: "text", text }],
+          })),
+        }),
+        create: async () => ({ data: { id: "review-session" } }),
+        prompt: async (request: { body?: { parts?: Array<{ text?: string }> } }) => {
+          state.promptCalls += 1
+          state.reviewerRequests.push(request.body?.parts?.[0]?.text ?? "")
+          return { data: { parts: [{ type: "text", text: reviewerText }] } }
+        },
+        abort: async () => ({ data: true }),
+        delete: async () => ({ data: true }),
+      },
+      postSessionIdPermissionsPermissionId: async (request: { body?: { response?: string } }) => {
+        state.permissionResponses.push(request.body?.response ?? "")
+        return { data: true }
+      },
+    }
+    const hooks = await autoMode(
+      {
+        client,
+        directory: "/workspace/project",
+        worktree: "/workspace/project",
+        project: { id: "project" },
+        serverUrl: new URL("http://localhost:4096"),
+        $: makeShell([]),
+      } as never,
+      { enabled: true, model: "openai/test-model" },
+    )
+    return { hooks, state, say: (text: string) => userMessages.push(text) }
+  }
+
+  test("does not present approval on the first soft-risky invocation", async () => {
+    const { hooks, state } = await makeApprovalHooks("ALLOW: reviewed", ["Install the Android SDK licenses."])
+
+    await executeBefore(hooks, "bash", { command: sdkCommand })
+
+    expect(state.promptCalls).toBe(1)
+    expect(state.reviewerRequests[0]).toContain("explicitApprovalPresent: false")
+    expect(state.reviewerRequests[0]).toContain("matchedFingerprint: false")
+  })
+
+  test('"yes" does not grant approval without a pending candidate for that operation', async () => {
+    const { hooks, state } = await makeApprovalHooks("ALLOW: reviewed", ["yes"])
+
+    await executeBefore(hooks, "bash", { command: sdkCommand })
+
+    expect(state.reviewerRequests[0]).toContain("explicitApprovalPresent: false")
+  })
+
+  test("explicit confirmation after a reviewed candidate grants scoped approval on the next matching invocation", async () => {
+    const { hooks, state, say } = await makeApprovalHooks("ALLOW: reviewed", ["Install the Android SDK licenses."])
+
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-1")
+    say("yes")
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-2")
+
+    expect(state.promptCalls).toBe(2)
+    expect(state.reviewerRequests[0]).toContain("explicitApprovalPresent: false")
+    expect(state.reviewerRequests[1]).toContain("explicitApprovalPresent: true")
+    expect(state.reviewerRequests[1]).toContain("matchedFingerprint: true")
+  })
+
+  test("scope expansion to a different external path requires fresh confirmation", async () => {
+    const { hooks, state, say } = await makeApprovalHooks("ALLOW: reviewed", ["Install the Android SDK licenses."])
+
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-1")
+    say("yes")
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-2")
+    await executeBefore(
+      hooks,
+      "bash",
+      { command: '~/Android/Sdk/cmdline-tools/latest/bin/sdkmanager "system-images;android-36;google_apis;x86_64"' },
+      "call-3",
+    )
+
+    expect(state.promptCalls).toBe(3)
+    expect(state.reviewerRequests[2]).toContain("explicitApprovalPresent: false")
+  })
+
+  test("a granted approval expires and no longer matches after its TTL", async () => {
+    const { hooks, state, say } = await makeApprovalHooks("ALLOW: reviewed", ["Install the Android SDK licenses."])
+    const originalNow = Date.now
+    try {
+      await executeBefore(hooks, "bash", { command: sdkCommand }, "call-1")
+      say("yes")
+      await executeBefore(hooks, "bash", { command: sdkCommand }, "call-2")
+      expect(state.reviewerRequests[1]).toContain("explicitApprovalPresent: true")
+
+      const future = Date.now() + 16 * 60 * 1000
+      Date.now = () => future
+      await executeBefore(hooks, "bash", { command: sdkCommand }, "call-3")
+      expect(state.reviewerRequests[2]).toContain("explicitApprovalPresent: false")
+    } finally {
+      Date.now = originalNow
+    }
+  })
+
+  test("a hard-blocked command is never approved regardless of confirmation", async () => {
+    const { hooks, state, say } = await makeApprovalHooks("ALLOW: reviewed", ["Install the Android SDK licenses."])
+
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-1")
+    say("yes")
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-2")
+
+    await expect(
+      executeBefore(hooks, "bash", { command: "sudo rm -rf ~/Android/Sdk" }, "call-3"),
+    ).rejects.toThrow("Auto-reviewer blocked bash")
+
+    // The hard-blocked command is statically rejected and never reaches the reviewer.
+    expect(state.promptCalls).toBe(2)
+  })
+
+  test("explicit rejection cancels a pending candidate", async () => {
+    const { hooks, state, say } = await makeApprovalHooks("ALLOW: reviewed", ["Install the Android SDK licenses."])
+
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-1")
+    say("no")
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-2")
+
+    expect(state.reviewerRequests[1]).toContain("explicitApprovalPresent: false")
+  })
+
+  test("revocation removes a previously granted approval", async () => {
+    const { hooks, state, say } = await makeApprovalHooks("ALLOW: reviewed", ["Install the Android SDK licenses."])
+
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-1")
+    say("yes")
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-2")
+    say("stop")
+    await executeBefore(hooks, "bash", { command: sdkCommand }, "call-3")
+
+    expect(state.promptCalls).toBe(3)
+    expect(state.reviewerRequests[1]).toContain("explicitApprovalPresent: true")
+    expect(state.reviewerRequests[2]).toContain("explicitApprovalPresent: false")
   })
 })
