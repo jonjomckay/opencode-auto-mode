@@ -20,6 +20,7 @@ For operations that require LLM classification, the plugin is fail-closed. If no
 - Reviews external filesystem access, source mutations, network operations, and remote-service tools with the configured model.
 - Applies task-scoped policy to secrets, data transmission, downloaded code, destructive changes, persistence, network exposure, remote mutations, and subagent delegation.
 - Caches decisions for the same tool call.
+- Tracks explicit in-chat approval deterministically, scoped to the exact tool, command, and paths, with TTL-based expiry and revocation, so a confirmed soft-risky operation (like an external toolchain download) is not blocked again on false-negative LLM inference.
 
 ## Requirements
 
@@ -252,6 +253,18 @@ Actual user-role messages are JSON-encoded and labeled as scope-only authorizati
 Tool outputs and reasoning blocks are excluded. The current invocation is included as a bounded, redacted summary. Unknown string fields, content, bodies, comments, patches, replacement strings, credentials, tokens, passwords, URL user information, URL path segments, and URL query names and values are removed; only the query-parameter count remains visible so the reviewer knows data was omitted. Oversized or deeply nested invocations and overlong path or Bash summaries block before review rather than silently authorizing a partial projection.
 
 Current Bash commands retain their reviewable control structure but pass through deterministic redaction for authorization headers, secret-named assignments and options, private keys, common credential formats, URL paths, and URL query values. External or ambiguous `apply_patch` calls include their patch text so the reviewer can inspect the exact change; detected secrets and oversized patches still fail closed. Raw recent Bash commands are never retransmitted. Bash reviews also include canonicalized path operands and the effective working directory. Dynamic expansion, grouping, ambiguous quoting or path resolution, and other shell forms whose effective targets cannot be represented exactly block before reviewer submission. Pattern-based redaction cannot recognize every possible opaque credential, so secrets should still be supplied through environment variables or protected files rather than literal command-line arguments. Reviewer context can be sent to a different provider than the parent conversation; choose the reviewer provider according to your data-handling requirements.
+
+## Deterministic User-Approval Handshake
+
+Explicit in-chat approval is tracked as session-scoped state, not only inferred by the LLM from conversation text.
+
+- When a Bash invocation is not statically hard-blocked but is soft-risky (an external or ambiguous path, or a dependency/artifact download such as `sdkmanager`, `npm install`, `pip install`, or `gradlew`), the plugin creates a pending approval candidate scoped to that exact tool, normalized command, and referenced path prefixes.
+- A short, unambiguous confirmation in the very next user message (for example `yes`, `yup`, `proceed`, `go ahead`, `do it`, `run it`, or `please continue`) only grants approval when it matches the pending candidate for that session; a stray "yes" with no pending candidate never grants approval.
+- A granted approval is scoped narrowly: it only reapplies to later invocations with the same tool, the same normalized command fingerprint, and target paths within the originally approved prefixes. A materially different command or an external path outside the approved scope requires fresh confirmation.
+- Approvals and pending candidates expire automatically (a pending candidate after a few minutes, a granted approval after longer) and are held in bounded, periodically evicted in-memory maps.
+- An explicit rejection or revocation (for example `no`, `stop`, `cancel`, `don't`, or `do not`) immediately cancels any pending candidate and any granted approval for the matching operation.
+- Structured approval facts (`explicitApprovalPresent`, `matchedFingerprint`, `approvalScope`, `approvalAgeMs`) are sent to the reviewer as trusted, code-computed authorization metadata, separate from untrusted conversation text, so the reviewer does not have to infer approval from free-form wording.
+- Hard-block rules (privilege escalation, destructive filesystem operations, secret exposure, and the other rules in `src/auto-reviewer-prompt.md`) are never overridden by approval state. Deterministic approval can only relax the soft-restriction rules for external paths and dependency/artifact downloads.
 
 ## Troubleshooting
 

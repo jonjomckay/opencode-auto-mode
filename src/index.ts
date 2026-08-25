@@ -1,4 +1,5 @@
 import { lstat, readFile, realpath, stat } from "node:fs/promises"
+import { homedir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 
 import type { Plugin } from "@opencode-ai/plugin"
@@ -11,6 +12,34 @@ const CONTEXT_TIMEOUT_MS = 3_000
 const CACHE_TTL_MS = 60_000
 const USER_CONTEXT_MAX_CHARS = 4_000
 const REVIEWER_PROMPT_URL = new URL("./auto-reviewer-prompt.md", import.meta.url)
+
+// Deterministic user-approval handling: session-scoped, TTL-bounded state that
+// tracks a pending risky-operation candidate and any explicitly granted
+// approvals so explicit in-chat confirmation is not left to LLM inference.
+const APPROVAL_CANDIDATE_TTL_MS = 5 * 60 * 1000
+const APPROVAL_GRANT_TTL_MS = 15 * 60 * 1000
+const MAX_APPROVAL_SESSIONS = 200
+const MAX_APPROVALS_PER_SESSION = 5
+const CONFIRMATION_MAX_CHARS = 60
+const CONFIRM_PHRASES = [
+  "yes",
+  "y",
+  "yeah",
+  "yup",
+  "yep",
+  "sure",
+  "proceed",
+  "go ahead",
+  "do it",
+  "run it",
+  "please continue",
+  "continue",
+  "ok",
+  "okay",
+]
+const REJECT_PHRASES = ["no", "nope", "stop", "cancel", "don't", "do not", "dont", "abort", "revoke"]
+const DOWNLOAD_SIGNAL =
+  /\b(sdkmanager|npm\s+install|npm\s+ci|pnpm\s+(add|install)|yarn\s+add|pip3?\s+install|apt(?:-get)?\s+install|brew\s+install|gradlew|go\s+install|cargo\s+install|curl\s+[^\n]*-[A-Za-z]*[oO]\b|wget\b)/i
 
 type ModelRef = {
   providerID: string
@@ -58,6 +87,27 @@ type ReviewContext = ConversationContext & {
 type Analysis = {
   behaviors: string[]
   hardBlockReason?: string
+}
+
+// A candidate is created the moment a soft-risky (not hard-blocked) invocation
+// is reviewed, and is promoted into a granted approval only by a deterministic,
+// scoped, explicit user confirmation matching that exact candidate.
+type ApprovalRecord = {
+  sessionID: string
+  tool: string
+  fingerprint: string
+  commandSummary: string
+  pathPrefixes: string[]
+  riskTags: string[]
+  createdAt: number
+  expiresAt: number
+}
+
+type ApprovalFacts = {
+  explicitApprovalPresent: boolean
+  matchedFingerprint: boolean
+  approvalScope: string | null
+  approvalAgeMs: number | null
 }
 
 type PathInspection = {
@@ -950,6 +1000,94 @@ function encodeContext(value: string): string {
   return JSON.stringify(value).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026")
 }
 
+/**
+ * Builds a stable fingerprint identifying a reviewed invocation so an
+ * approval can only be matched against the same (or trivially reformatted)
+ * tool call, never against unrelated commands.
+ */
+export function normalizeCommandFingerprint(tool: string, command: string): string {
+  return `${tool}|${command.trim().replace(/\s+/g, " ").toLowerCase()}`
+}
+
+/**
+ * Extracts absolute-looking path segments referenced by a command so an
+ * approval can be scoped to the canonical targets it actually covers.
+ */
+export function extractApprovalPathPrefixes(command: string): string[] {
+  const matches = command.match(/(~\/[^\s"'|;&<>]+|(?<![\w.])\/[^\s"'|;&<>]+)/g) ?? []
+  const home = homedir()
+  const normalized = matches.map((match) => (match.startsWith("~") ? join(home, match.slice(1)) : match))
+  return [...new Set(normalized)].slice(0, 5)
+}
+
+/**
+ * Deterministically classifies the most recent user message as an explicit
+ * confirmation or rejection. Only short, unambiguous replies count; longer
+ * messages are never inferred as approval or revocation.
+ */
+export function detectApprovalSignal(text: string | null | undefined): "confirm" | "reject" | null {
+  if (!text) return null
+  const normalized = text.trim().toLowerCase().replace(/[.!?]+$/, "")
+  if (!normalized || normalized.length > CONFIRMATION_MAX_CHARS) return null
+  const matchesPhrase = (phrases: string[]) =>
+    phrases.some((phrase) => normalized === phrase || normalized.startsWith(`${phrase} `) || normalized.startsWith(`${phrase},`))
+  if (matchesPhrase(REJECT_PHRASES)) return "reject"
+  if (matchesPhrase(CONFIRM_PHRASES)) return "confirm"
+  return null
+}
+
+/**
+ * A soft-risky operation is not statically hard-blocked but touches an
+ * external or ambiguous path, or looks like a dependency/artifact download.
+ * Only these operations get a pending approval candidate.
+ */
+export function isSoftRiskyOperation(
+  analysis: Analysis,
+  external: boolean,
+  ambiguous: boolean,
+  command: string,
+): boolean {
+  if (analysis.hardBlockReason) return false
+  return external || ambiguous || DOWNLOAD_SIGNAL.test(command)
+}
+
+/**
+ * Matches a granted approval against the current invocation: same tool,
+ * same normalized fingerprint, all referenced paths within the approved
+ * prefixes, and not expired. Scope expansion or a different fingerprint
+ * never matches, requiring fresh confirmation.
+ */
+export function approvalMatches(
+  approval: ApprovalRecord,
+  tool: string,
+  fingerprint: string,
+  pathPrefixes: string[],
+  now: number,
+): boolean {
+  if (approval.expiresAt <= now) return false
+  if (approval.tool !== tool) return false
+  if (approval.fingerprint !== fingerprint) return false
+  if (approval.pathPrefixes.length > 0) {
+    const withinScope = pathPrefixes.every((prefix) =>
+      approval.pathPrefixes.some(
+        (approved) => prefix === approved || prefix.startsWith(`${approved}/`) || approved.startsWith(`${prefix}/`),
+      ),
+    )
+    if (!withinScope) return false
+  }
+  return true
+}
+
+function formatApprovalFacts(facts: ApprovalFacts): string {
+  const lines = [
+    `explicitApprovalPresent: ${facts.explicitApprovalPresent}`,
+    `matchedFingerprint: ${facts.matchedFingerprint}`,
+    `approvalScope: ${facts.approvalScope ?? "none"}`,
+    `approvalAgeMs: ${facts.approvalAgeMs ?? "n/a"}`,
+  ]
+  return `<authorization_metadata scope_only="true" encoding="json_string">\n${encodeContext(lines.join("\n"))}\n</authorization_metadata>`
+}
+
 function formatContext(context: ReviewContext): string {
   const authorizationSections: string[] = []
   const untrustedSections: string[] = []
@@ -986,6 +1124,7 @@ function buildReviewRequest(
   directory: string,
   context: ReviewContext,
   analysis: Analysis,
+  approvalFacts: ApprovalFacts,
 ): string {
   const behaviors = analysis.behaviors.length ? analysis.behaviors.map((behavior) => `- ${behavior}`).join("\n") : "- none detected"
   const metadata = encodeContext(
@@ -999,6 +1138,8 @@ function buildReviewRequest(
 <untrusted_context encoding="json_string">
 ${metadata}
 </untrusted_context>
+
+${formatApprovalFacts(approvalFacts)}
 
 ${formatContext(context)}
 
@@ -1047,7 +1188,119 @@ export default (async ({ client, directory, $ }, options) => {
     : DEFAULT_REVIEW_TIMEOUT_MS
   const cache = new Map<string, { expires: number; decision: Decision }>()
   const pending = new Map<string, Promise<Decision>>()
+  // Deterministic user-approval state, scoped per session and bounded in size.
+  const pendingCandidates = new Map<string, ApprovalRecord>()
+  const grantedApprovals = new Map<string, ApprovalRecord[]>()
   let fallbackModel: ModelRef | undefined
+
+  function evictApprovalState(now: number) {
+    for (const [sessionID, candidate] of pendingCandidates) {
+      if (candidate.expiresAt <= now) pendingCandidates.delete(sessionID)
+    }
+    for (const [sessionID, approvals] of grantedApprovals) {
+      const active = approvals.filter((approval) => approval.expiresAt > now)
+      if (active.length) grantedApprovals.set(sessionID, active)
+      else grantedApprovals.delete(sessionID)
+    }
+    while (pendingCandidates.size > MAX_APPROVAL_SESSIONS) {
+      const oldest = [...pendingCandidates.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]
+      if (!oldest) break
+      pendingCandidates.delete(oldest[0])
+    }
+    while (grantedApprovals.size > MAX_APPROVAL_SESSIONS) {
+      const oldestKey = grantedApprovals.keys().next().value
+      if (oldestKey === undefined) break
+      grantedApprovals.delete(oldestKey)
+    }
+  }
+
+  /**
+   * Resolves deterministic approval facts for the invocation currently being
+   * reviewed. Explicit rejection always cancels pending/matching granted
+   * approval first. A confirmation only promotes a candidate into a granted
+   * approval when it matches the exact pending candidate for that session.
+   * A prior granted approval only applies when tool, fingerprint, and path
+   * scope still match. Hard-block decisions never reach this function.
+   */
+  function resolveApprovalFacts(
+    sessionID: string,
+    tool: string,
+    command: string,
+    analysis: Analysis,
+    external: boolean,
+    ambiguous: boolean,
+    lastUserMessage: string | null,
+  ): ApprovalFacts {
+    const now = Date.now()
+    evictApprovalState(now)
+    const signal = detectApprovalSignal(lastUserMessage)
+    const fingerprint = normalizeCommandFingerprint(tool, command)
+
+    if (signal === "reject") {
+      pendingCandidates.delete(sessionID)
+      const approvals = grantedApprovals.get(sessionID)
+      if (approvals) {
+        const remaining = approvals.filter((approval) => approval.fingerprint !== fingerprint)
+        if (remaining.length) grantedApprovals.set(sessionID, remaining)
+        else grantedApprovals.delete(sessionID)
+      }
+    }
+
+    const none: ApprovalFacts = {
+      explicitApprovalPresent: false,
+      matchedFingerprint: false,
+      approvalScope: null,
+      approvalAgeMs: null,
+    }
+    if (!isSoftRiskyOperation(analysis, external, ambiguous, command)) return none
+
+    const pathPrefixes = extractApprovalPathPrefixes(command)
+    const riskTags = [
+      ...(external ? ["external-path"] : []),
+      ...(ambiguous ? ["ambiguous-path"] : []),
+      ...(DOWNLOAD_SIGNAL.test(command) ? ["download-artifact"] : []),
+    ]
+
+    const existingApprovals = grantedApprovals.get(sessionID) ?? []
+    const matched = existingApprovals.find((approval) => approvalMatches(approval, tool, fingerprint, pathPrefixes, now))
+    if (matched) {
+      pendingCandidates.delete(sessionID)
+      return {
+        explicitApprovalPresent: true,
+        matchedFingerprint: true,
+        approvalScope: matched.commandSummary,
+        approvalAgeMs: now - matched.createdAt,
+      }
+    }
+
+    if (signal === "confirm") {
+      const candidate = pendingCandidates.get(sessionID)
+      if (candidate && candidate.expiresAt > now && candidate.tool === tool && candidate.fingerprint === fingerprint) {
+        const approval: ApprovalRecord = { ...candidate, createdAt: now, expiresAt: now + APPROVAL_GRANT_TTL_MS }
+        const approvals = existingApprovals.filter((existing) => existing.fingerprint !== fingerprint)
+        grantedApprovals.set(sessionID, [...approvals, approval].slice(-MAX_APPROVALS_PER_SESSION))
+        pendingCandidates.delete(sessionID)
+        return {
+          explicitApprovalPresent: true,
+          matchedFingerprint: true,
+          approvalScope: approval.commandSummary,
+          approvalAgeMs: 0,
+        }
+      }
+    }
+
+    pendingCandidates.set(sessionID, {
+      sessionID,
+      tool,
+      fingerprint,
+      commandSummary: truncate(command, 200),
+      pathPrefixes,
+      riskTags,
+      createdAt: now,
+      expiresAt: now + APPROVAL_CANDIDATE_TTL_MS,
+    })
+    return none
+  }
 
   async function log(level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) {
     try {
@@ -1081,6 +1334,11 @@ export default (async ({ client, directory, $ }, options) => {
   ): Promise<Decision> {
     await notify(`Reviewing: ${truncate(command, 120)}`, "info")
     const context = await gatherContext(client, $, directory, sessionID, callID)
+    const lastUserMessage =
+      context.recentUser.length > 0 ? context.recentUser[context.recentUser.length - 1] ?? null : context.firstUser
+    const external = analysis.behaviors.some((behavior) => behavior.startsWith("external-path"))
+    const ambiguous = analysis.behaviors.some((behavior) => behavior.startsWith("ambiguous-path"))
+    const approvalFacts = resolveApprovalFacts(sessionID, permission, command, analysis, external, ambiguous, lastUserMessage)
     const model = configuredModel ?? context.model ?? fallbackModel
     const created = await client.session.create({
       body: { parentID: sessionID, title: `Auto review: ${truncate(command, 60)}` },
@@ -1101,7 +1359,7 @@ export default (async ({ client, directory, $ }, options) => {
             parts: [
               {
                 type: "text",
-                text: buildReviewRequest(command, permission, directory, context, analysis),
+                text: buildReviewRequest(command, permission, directory, context, analysis, approvalFacts),
               },
             ],
           },
