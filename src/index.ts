@@ -1256,6 +1256,10 @@ export default (async ({ client, directory, $ }, options) => {
       }
     },
     "tool.execute.before": async (input, output) => {
+      if (input.tool !== "bash") {
+        return;
+      }
+
       const args = output.args && typeof output.args === "object" ? (output.args as Record<string, unknown>) : {}
       const analysis = analyzeTool(input.tool, args)
       const pathInspection = await inspectToolPaths(input.tool, args, directory, canonicalWorkspace)
